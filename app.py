@@ -1,12 +1,13 @@
 import os
 import re
 import time
+import json
 import hashlib
 import datetime as dt
 from typing import Optional, List
 
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright
 
 # =============================
 # SETTINGS
@@ -14,120 +15,53 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 DAYS_AHEAD_INCLUSIVE = 8
 MIN_MILES = 35.0
 SECONDS_PER_DATE_VIEW = 3
+SECONDS_BETWEEN_CYCLES = 3
+
+MARKETPLACE_URL = "https://mtm.mtmlink.net/pe/v1/marketplace?orgId=2291654"
 
 ALLOWED_CITIES = {
     "Milwaukee","Madison","Fitchburg","Middleton","Monona","Sun Prairie",
     "Waunakee","Verona","McFarland","DeForest","Oregon","Stoughton",
-    "Cottage Grove","Mount Horeb",
-    "Minneapolis","Edina","Bloomington","Burnsville","Rochester",
-    "St Paul","Saint Paul","Saint Louis Park","Hudson","Chicago",
+    "Cottage Grove","Mount Horeb","Minneapolis","Edina","Bloomington",
+    "Burnsville","Rochester","St Paul","Saint Paul","Saint Louis Park",
+    "Hudson","Chicago",
 }
-
-MARKETPLACE_URL = "https://mtm.mtmlink.net/pe/v1/marketplace?orgId=2291654"
 
 # =============================
 # TELEGRAM
 # =============================
-TELEGRAM_BOT_TOKEN = os.getenv("8224181562:AAE4R-PQ6FMbRURa9IW--QJF77UNpbQ0CVc")
-TELEGRAM_CHAT_ID = os.getenv("-5186126864")
+TELEGRAM_BOT_TOKEN = os.environ.get("8224181562:AAE4R-PQ6FMbRURa9IW--QJF77UNpbQ0CVc")
+TELEGRAM_CHAT_ID = os.environ.get("-5186126864")
 
-
-def send_telegram(text: str) -> None:
+def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text},
-            timeout=10,
-        )
-    except:
-        pass
-
+    requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+        timeout=10
+    )
 
 # =============================
 # HELPERS
 # =============================
-def clean_address_block(text: str) -> str:
-    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in text.splitlines() if ln.strip()]
-    return "\n".join(lines)
+def clean(text):
+    return "\n".join(x.strip() for x in text.splitlines() if x.strip())
 
-def extract_city(addr_block: str) -> Optional[str]:
-    for ln in addr_block.splitlines():
-        m = re.search(r"^(.*)\s+(WI|MN|IL)\b", ln, re.I)
-        if m and not any(ch.isdigit() for ch in m.group(1)):
-            return m.group(1).title()
-    return None
+def extract_city(text):
+    for ln in reversed(text.splitlines()):
+        m = re.search(r"(.*)\s+(WI|MN|IL)\b", ln, re.I)
+        if m:
+            c = m.group(1).strip()
+            if not any(x.isdigit() for x in c):
+                return c.title()
+    return ""
 
-def parse_miles(s: str) -> Optional[float]:
-    try:
-        return float(s.replace(",", "").strip())
-    except:
-        return None
+def trip_key(*args):
+    return hashlib.sha256("|".join(map(str,args)).encode()).hexdigest()
 
-def calc_trip_cost(miles: float) -> float:
-    return 19 + max(0, miles - 5) * 1.8
-
-def trip_key(*parts) -> str:
-    return hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()
-
-def format_date_mmddyyyy(d: dt.date) -> str:
+def fmt_date(d):
     return d.strftime("%m/%d/%Y")
-
-
-# =============================
-# PLAYWRIGHT FUNCTIONS
-# =============================
-def ensure_outside_service_area_on(page):
-    try:
-        toggle = page.locator("[role='switch']").first
-        if toggle.get_attribute("aria-checked") != "true":
-            toggle.click(force=True)
-            time.sleep(0.5)
-    except:
-        pass
-
-
-def find_date_input(page):
-    for i in range(page.locator("input").count()):
-        el = page.locator("input").nth(i)
-        try:
-            if re.match(r"\d{2}/\d{2}/\d{4}", el.input_value()):
-                return el
-        except:
-            pass
-    return None
-
-
-def set_filter_date(page, date_str):
-    inp = find_date_input(page)
-    if not inp:
-        return
-    inp.click(force=True)
-    inp.fill(date_str)
-    page.keyboard.press("Enter")
-    time.sleep(1)
-
-
-def read_trips(page) -> List[dict]:
-    trips = []
-    rows = page.locator("table tbody tr")
-    for i in range(min(rows.count(), 200)):
-        tds = rows.nth(i).locator("td")
-        if tds.count() < 5:
-            continue
-        miles = parse_miles(tds.nth(4).inner_text())
-        if miles is None:
-            continue
-        trips.append({
-            "appt": tds.nth(0).inner_text().strip(),
-            "pickup_time": tds.nth(1).inner_text().strip(),
-            "pickup": clean_address_block(tds.nth(2).inner_text()),
-            "dropoff": clean_address_block(tds.nth(3).inner_text()),
-            "miles": miles,
-        })
-    return trips
-
 
 # =============================
 # MAIN
@@ -142,58 +76,62 @@ def main():
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        context = browser.new_context()
-        page = context.new_page()
 
+        context = browser.new_context()
+
+        # LOAD COOKIES
+        if os.path.exists("cookies.json"):
+            with open("cookies.json") as f:
+                context.add_cookies(json.load(f))
+
+        page = context.new_page()
         page.goto(MARKETPLACE_URL, timeout=60000)
-        time.sleep(5)
+        time.sleep(3)
 
         while True:
-            try:
-                ensure_outside_service_area_on(page)
-                today = dt.date.today()
+            today = dt.date.today()
 
-                for offset in range(DAYS_AHEAD_INCLUSIVE + 1):
-                    d = today + dt.timedelta(days=offset)
-                    date_str = format_date_mmddyyyy(d)
+            for i in range(DAYS_AHEAD_INCLUSIVE + 1):
+                date = today + dt.timedelta(days=i)
+                date_str = fmt_date(date)
 
-                    set_filter_date(page, date_str)
-                    ensure_outside_service_area_on(page)
+                page.fill("input", date_str)
+                page.keyboard.press("Enter")
+                time.sleep(2)
 
-                    trips = read_trips(page)
+                rows = page.locator("table tbody tr")
+                for r in range(rows.count()):
+                    tds = rows.nth(r).locator("td")
+                    if tds.count() < 5:
+                        continue
 
-                    for t in trips:
-                        if t["miles"] <= MIN_MILES:
-                            continue
+                    miles = float(tds.nth(4).inner_text().replace(",",""))
+                    if miles < MIN_MILES:
+                        continue
 
-                        pc = extract_city(t["pickup"]) or ""
-                        dc = extract_city(t["dropoff"]) or ""
+                    pickup = clean(tds.nth(2).inner_text())
+                    dropoff = clean(tds.nth(3).inner_text())
 
-                        if pc not in ALLOWED_CITIES and dc not in ALLOWED_CITIES:
-                            continue
+                    pc = extract_city(pickup)
+                    dc = extract_city(dropoff)
 
-                        key = trip_key(date_str, t["appt"], t["pickup_time"], t["pickup"], t["dropoff"], t["miles"])
-                        if key in seen:
-                            continue
-                        seen.add(key)
+                    if pc not in ALLOWED_CITIES and dc not in ALLOWED_CITIES:
+                        continue
 
-                        cost = calc_trip_cost(t["miles"])
-                        msg = (
-                            f"🚨 {t['miles']:.1f} miles | {date_str}\n"
-                            f"Appt: {t['appt']}\nPickup: {t['pickup_time']}\n"
-                            f"Cost ≈ ${cost:.2f}\n\n"
-                            f"Pickup:\n{t['pickup']}\n\nDropoff:\n{t['dropoff']}"
-                        )
-                        send_telegram(msg)
+                    key = trip_key(date_str, pickup, dropoff, miles)
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
-                    time.sleep(SECONDS_PER_DATE_VIEW)
+                    send_telegram(
+                        f"🚨 {miles} miles on {date_str}\n\n"
+                        f"Pickup:\n{pickup}\n\nDropoff:\n{dropoff}"
+                    )
 
-                page.reload()
-                time.sleep(5)
+                time.sleep(SECONDS_PER_DATE_VIEW)
 
-            except Exception:
-                time.sleep(10)
-
+            page.reload()
+            time.sleep(SECONDS_BETWEEN_CYCLES)
 
 if __name__ == "__main__":
     main()
